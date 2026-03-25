@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Ee
+set -u
+set -o pipefail
 
 # ============================================================
 # OpenClaw Proxmox Helper Script - Version 1
