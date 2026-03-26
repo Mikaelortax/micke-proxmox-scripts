@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # ============================================================
-# OpenClaw Helper Script - Version 2
+# OpenClaw Helper Script - Version 2.1
 # Syfte:
 # - Körs INNE i en redan fungerande Debian 12 LXC
 # - Verifierar miljön
@@ -15,6 +15,7 @@ set -Eeuo pipefail
 # - Skapar startscript och health-script
 # - Startar gateway i bakgrunden
 # - Verifierar health och port 18789
+# - Förbereder SSH för tunnel-access
 # - Skriver ut nästa steg för SSH-tunnel och localhost-access
 # ============================================================
 
@@ -26,12 +27,14 @@ EXPECTED_HOSTNAME="opentest"
 EXPECTED_IP="192.168.0.206"
 GATEWAY_PORT="18789"
 
-SCRIPT_NAME="OpenClaw Helper Script - Version 2"
+SCRIPT_NAME="OpenClaw Helper Script - Version 2.1"
 START_SCRIPT="/root/openclaw-start.sh"
 HEALTH_SCRIPT="/root/openclaw-health.sh"
 LOG_FILE="/root/openclaw-gateway.log"
 OPENCLAW_DIR="${HOME}/.openclaw"
 OPENCLAW_CONFIG="${OPENCLAW_DIR}/openclaw.json"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_CONFIG_BACKUP="/etc/ssh/sshd_config.bak.$(date +%Y%m%d-%H%M%S)"
 
 # -----------------------------
 # Färger
@@ -188,7 +191,10 @@ install_base_packages() {
     iproute2 \
     net-tools \
     python3 \
-    git
+    git \
+    openssh-server \
+    sed \
+    grep
 
   ok "Baspaket installerade/verifierade."
 }
@@ -353,6 +359,12 @@ set -Eeuo pipefail
 PORT="${GATEWAY_PORT}"
 LOG_FILE="${LOG_FILE}"
 
+if ss -ltn 2>/dev/null | grep -q ":\\\${PORT} "; then
+  echo "[OK] Gateway verkar redan lyssna på port \${PORT}."
+  echo "[INFO] Ingen ny start behövs."
+  exit 0
+fi
+
 echo "[INFO] Startar OpenClaw gateway på port \${PORT} ..."
 nohup openclaw gateway --port "\${PORT}" --bind loopback --verbose > "\${LOG_FILE}" 2>&1 &
 sleep 5
@@ -442,20 +454,93 @@ verify_gateway() {
   fi
 }
 
+backup_sshd_config() {
+  [ -f "$SSHD_CONFIG" ] || fail "Kunde inte hitta ${SSHD_CONFIG}."
+  cp -a "$SSHD_CONFIG" "$SSHD_CONFIG_BACKUP"
+  ok "Backup skapad av sshd_config: $SSHD_CONFIG_BACKUP"
+}
+
+ensure_sshd_setting() {
+  local key="$1"
+  local value="$2"
+
+  if grep -qE "^[#[:space:]]*${key}[[:space:]]+" "$SSHD_CONFIG"; then
+    sed -i -E "s|^[#[:space:]]*${key}[[:space:]]+.*|${key} ${value}|g" "$SSHD_CONFIG"
+  else
+    printf '\n%s %s\n' "$key" "$value" >> "$SSHD_CONFIG"
+  fi
+}
+
+prepare_ssh_access() {
+  section "Förbered SSH-access"
+
+  info "Verifierar att openssh-server finns ..."
+  dpkg -s openssh-server >/dev/null 2>&1 || fail "openssh-server verkar inte vara installerad."
+
+  backup_sshd_config
+
+  info "Sätter PermitRootLogin yes ..."
+  ensure_sshd_setting "PermitRootLogin" "yes"
+
+  info "Sätter PasswordAuthentication yes ..."
+  ensure_sshd_setting "PasswordAuthentication" "yes"
+
+  info "Verifierar effektiv SSH-konfiguration ..."
+  if sshd -t; then
+    ok "sshd_config syntax OK."
+  else
+    fail "sshd_config innehåller fel efter ändringar. Återställ från backup: $SSHD_CONFIG_BACKUP"
+  fi
+
+  info "Aktiverar och startar om SSH-tjänsten ..."
+  systemctl enable ssh >/dev/null 2>&1 || true
+  systemctl restart ssh
+
+  if systemctl is-active --quiet ssh; then
+    ok "SSH-tjänsten är aktiv."
+  else
+    fail "SSH-tjänsten kunde inte startas korrekt."
+  fi
+
+  info "Kontrollerar att port 22 lyssnar ..."
+  if ss -ltn 2>/dev/null | grep -q ':22 '; then
+    ok "SSH lyssnar på port 22."
+  else
+    warn "Port 22 verkar inte lyssna ännu. Kontrollera 'systemctl status ssh --no-pager'."
+  fi
+}
+
+set_root_password_interactive() {
+  section "Sätt root-lösenord för SSH"
+
+  echo "Nästa steg är att sätta eller uppdatera root-lösenordet i containern."
+  echo "Detta behövs för att SSH-tunneln från din dator ska fungera med root@${EXPECTED_IP}."
+  echo
+  echo "När du kör passwd visas inga tecken när du skriver lösenord. Det är normalt."
+  echo
+
+  pause_for_enter
+
+  passwd root
+  ok "Root-lösenordet har uppdaterats."
+}
+
 print_final_summary() {
   section "Klart - nästa steg"
 
-  echo "OpenClaw Version 2-scriptet har kört klart."
+  echo "OpenClaw Version 2.1-scriptet har kört klart."
   echo
   echo "Viktiga filer:"
   echo "  Huvudconfig : ${OPENCLAW_CONFIG}"
   echo "  Startscript : ${START_SCRIPT}"
   echo "  Health      : ${HEALTH_SCRIPT}"
   echo "  Loggfil     : ${LOG_FILE}"
+  echo "  SSH-backup  : ${SSHD_CONFIG_BACKUP}"
   echo
   echo "Snabba kommandon inne i containern:"
   echo "  ${START_SCRIPT}"
   echo "  ${HEALTH_SCRIPT}"
+  echo "  systemctl status ssh --no-pager"
   echo "  openclaw doctor"
   echo "  openclaw logs --follow"
   echo
@@ -470,8 +555,9 @@ print_final_summary() {
   echo
   echo "Om något inte fungerar:"
   echo "  1. ${HEALTH_SCRIPT}"
-  echo "  2. openclaw doctor"
-  echo "  3. openclaw logs --follow"
+  echo "  2. systemctl status ssh --no-pager"
+  echo "  3. openclaw doctor"
+  echo "  4. openclaw logs --follow"
 }
 
 main() {
@@ -498,6 +584,8 @@ main() {
   create_health_script
   start_gateway
   verify_gateway
+  prepare_ssh_access
+  set_root_password_interactive
   print_final_summary
 }
 
